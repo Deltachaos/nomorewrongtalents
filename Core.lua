@@ -80,7 +80,9 @@ local function GetSpecTable(specID)
 	end
 	local t = NoMoreWrongTalentsDB.specs[specID]
 	t.dungeons = t.dungeons or {}
+	t.dungeonsGear = t.dungeonsGear or {}
 	t.raids = t.raids or {}
+	t.raidsGear = t.raidsGear or {}
 	return t
 end
 
@@ -325,21 +327,21 @@ function NMT:FilterEncounterRowsNotDefeatedThisInstance(encounterRows)
 	return out
 end
 
---- Boss rows from the EJ encounter list that have a saved expected loadout (current spec).
-function NMT:FilterRaidBossesWithLoadout(journalInstanceID, encounterRows)
+--- Boss rows that have a saved expected talent loadout and/or gear set (current spec).
+function NMT:FilterRaidBossesWithExpectation(journalInstanceID, encounterRows)
 	if not journalInstanceID or not encounterRows then
 		return {}
 	end
 	local out = {}
 	for _, e in ipairs(encounterRows) do
-		if self:GetExpectedRaidLoadout(journalInstanceID, e.index) then
+		if self:GetExpectedRaidLoadout(journalInstanceID, e.index) or self:GetExpectedRaidGear(journalInstanceID, e.index) then
 			out[#out + 1] = e
 		end
 	end
 	return out
 end
 
---- Full raid encounter list for this journal, narrowed to bosses pinned on the current map, then loadout-only rows.
+--- Full raid encounter list for this journal, narrowed to bosses pinned on the current map, then rows with any saved expectation.
 function NMT:GetRaidBossChoicesForContext(journalInstanceID, difficultyID)
 	local encounters = self:GetEncounterListForJournalInstance(journalInstanceID, difficultyID)
 	if #encounters == 0 then
@@ -347,7 +349,7 @@ function NMT:GetRaidBossChoicesForContext(journalInstanceID, difficultyID)
 	end
 	local onThisMap = self:FilterEncounterRowsForPlayerMap(encounters)
 	local notKilled = self:FilterEncounterRowsNotDefeatedThisInstance(onThisMap)
-	return self:FilterRaidBossesWithLoadout(journalInstanceID, notKilled)
+	return self:FilterRaidBossesWithExpectation(journalInstanceID, notKilled)
 end
 
 function NMT:ClearRaidBossPick()
@@ -486,6 +488,99 @@ function NMT:GetActiveLoadoutName()
 	return self:GetLoadoutDisplayName(self:GetSelectedLoadoutConfigID())
 end
 
+-- Equipment sets (saved Blizzard sets) -----------------------------------------
+
+function NMT:CanUseEquipmentSets()
+	local EQ = C_EquipmentSet
+	return EQ and EQ.CanUseEquipmentSets and EQ.CanUseEquipmentSets() == true
+end
+
+function NMT:GetEquipmentSetList()
+	local list = {}
+	local EQ = C_EquipmentSet
+	if not self:CanUseEquipmentSets() or not EQ.GetEquipmentSetIDs then
+		return list
+	end
+	local ids = EQ.GetEquipmentSetIDs()
+	if not ids then
+		return list
+	end
+	for _, setID in ipairs(ids) do
+		local name = EQ.GetEquipmentSetInfo(setID)
+		if name and name ~= "" then
+			list[#list + 1] = { id = setID, name = name }
+		end
+	end
+	table.sort(list, function(a, b)
+		if strcmputf8i then
+			return strcmputf8i(a.name, b.name) < 0
+		end
+		return a.name:lower() < b.name:lower()
+	end)
+	return list
+end
+
+function NMT:GetEquipmentSetDisplayName(equipmentSetID)
+	if not equipmentSetID then
+		return nil
+	end
+	local EQ = C_EquipmentSet
+	if not EQ or not EQ.GetEquipmentSetInfo then
+		return nil
+	end
+	local name = EQ.GetEquipmentSetInfo(equipmentSetID)
+	return name
+end
+
+function NMT:IsEquipmentSetEquipped(equipmentSetID)
+	if not equipmentSetID then
+		return false
+	end
+	local EQ = C_EquipmentSet
+	if not EQ or not EQ.GetEquipmentSetInfo then
+		return false
+	end
+	local _, _, _, isEquipped = EQ.GetEquipmentSetInfo(equipmentSetID)
+	return isEquipped == true
+end
+
+function NMT:GetEquippedEquipmentSetID()
+	local EQ = C_EquipmentSet
+	if not self:CanUseEquipmentSets() or not EQ.GetEquipmentSetIDs then
+		return nil
+	end
+	local ids = EQ.GetEquipmentSetIDs()
+	if not ids then
+		return nil
+	end
+	for _, setID in ipairs(ids) do
+		local _, _, _, isEquipped = EQ.GetEquipmentSetInfo(setID)
+		if isEquipped then
+			return setID
+		end
+	end
+	return nil
+end
+
+--- @return ok, errKey ("not_found"|"combat"|"api"|"failed")
+function NMT:ApplyGearSetByID(equipmentSetID)
+	if not equipmentSetID then
+		return false, "not_found"
+	end
+	if InCombatLockdown() then
+		return false, "combat"
+	end
+	local EQ = C_EquipmentSet
+	if not EQ or not EQ.UseEquipmentSet or not self:CanUseEquipmentSets() then
+		return false, "api"
+	end
+	local setWasEquipped = EQ.UseEquipmentSet(equipmentSetID)
+	if setWasEquipped then
+		return true, nil
+	end
+	return false, "failed"
+end
+
 function NMT:GetExpectedDungeonLoadout(cmID)
 	local specID = GetCurrentSpecID()
 	if not specID or not cmID then return nil end
@@ -524,6 +619,44 @@ function NMT:SetExpectedRaidLoadout(journalInstanceID, bossIndex, configID)
 	end
 end
 
+function NMT:GetExpectedDungeonGear(cmID)
+	local specID = GetCurrentSpecID()
+	if not specID or not cmID then return nil end
+	local v = GetSpecTable(specID).dungeonsGear[cmID]
+	return type(v) == "number" and v or nil
+end
+
+function NMT:SetExpectedDungeonGear(cmID, equipmentSetID)
+	local specID = GetCurrentSpecID()
+	if not specID or not cmID then return end
+	if equipmentSetID == nil then
+		GetSpecTable(specID).dungeonsGear[cmID] = nil
+	else
+		GetSpecTable(specID).dungeonsGear[cmID] = equipmentSetID
+	end
+end
+
+function NMT:GetExpectedRaidGear(journalInstanceID, bossIndex)
+	local specID = GetCurrentSpecID()
+	if not specID or not journalInstanceID or not bossIndex then return nil end
+	local g = GetSpecTable(specID).raidsGear[journalInstanceID]
+	if not g then return nil end
+	local v = g[bossIndex]
+	return type(v) == "number" and v or nil
+end
+
+function NMT:SetExpectedRaidGear(journalInstanceID, bossIndex, equipmentSetID)
+	local specID = GetCurrentSpecID()
+	if not specID or not journalInstanceID or not bossIndex then return end
+	local spec = GetSpecTable(specID)
+	spec.raidsGear[journalInstanceID] = spec.raidsGear[journalInstanceID] or {}
+	if equipmentSetID == nil then
+		spec.raidsGear[journalInstanceID][bossIndex] = nil
+	else
+		spec.raidsGear[journalInstanceID][bossIndex] = equipmentSetID
+	end
+end
+
 --- @return expectedConfigID, contextKind, contextDetailTable
 function NMT:GetExpectedForCurrentInstance()
 	local cmID = self:GetCurrentDungeonCmID()
@@ -538,21 +671,24 @@ function NMT:GetExpectedForCurrentInstance()
 	return nil, nil, nil
 end
 
---- Mythic+ / dungeon: warn only when a saved expected loadout exists and differs from selection.
+--- Mythic+ / dungeon: warn when a saved talent and/or gear expectation exists and something does not match.
 function NMT:ShouldWarnForDungeon()
 	local cmID = self:GetCurrentDungeonCmID()
 	if not cmID then
 		return false
 	end
 	local expectedID = self:GetExpectedDungeonLoadout(cmID)
-	if not expectedID then
+	local expectedGear = self:GetExpectedDungeonGear(cmID)
+	if not expectedID and not expectedGear then
 		return false
 	end
 	local currentID = self:GetSelectedLoadoutConfigID()
-	if not currentID or currentID == expectedID then
+	local talentMismatch = expectedID and (not currentID or currentID ~= expectedID)
+	local gearMismatch = expectedGear and not self:IsEquipmentSetEquipped(expectedGear)
+	if not talentMismatch and not gearMismatch then
 		return false
 	end
-	return true, expectedID, currentID, "dungeon", { cmID = cmID }
+	return true, expectedID, currentID, "dungeon", { cmID = cmID }, expectedGear
 end
 
 function NMT:ShouldWarnNow()
@@ -575,30 +711,27 @@ function NMT:PresentRaidTalentWarning(raid, raidKey)
 	if not self.UI or not self.UI.ShowWarning then
 		return
 	end
-	local expectedID = self:GetExpectedRaidLoadout(raid.journalInstanceID, raid.bossIndex)
-	local currentID = self:GetSelectedLoadoutConfigID()
-	self.UI:ShowWarning(
-		self:GetLoadoutDisplayName(currentID) or "?",
-		expectedID and (self:GetLoadoutDisplayName(expectedID) or "?") or "Not set",
-		"raid",
-		raid,
-		expectedID
-	)
 	if raidKey then
 		self._raidPromptShownForKey = raidKey
 	end
+	-- Raid boss UI fills labels via RefreshRaidWarningFromBossPick.
+	self.UI:ShowWarning(nil, nil, "raid", raid, nil, nil, nil, nil)
 end
 
-function NMT:PresentDungeonTalentWarning(expectedID, currentID, kind, ctx)
+function NMT:PresentDungeonTalentWarning(expectedID, currentID, kind, ctx, expectedGearID)
 	if not self.UI or not self.UI.ShowWarning then
 		return
 	end
+	local curGearID = self:GetEquippedEquipmentSetID()
 	self.UI:ShowWarning(
-		self:GetLoadoutDisplayName(currentID) or "?",
-		self:GetLoadoutDisplayName(expectedID) or "?",
+		self:GetLoadoutDisplayName(currentID) or "—",
+		expectedID and (self:GetLoadoutDisplayName(expectedID) or "?") or "—",
 		kind,
 		ctx,
-		expectedID
+		expectedID,
+		self:GetEquipmentSetDisplayName(curGearID) or "—",
+		expectedGearID and (self:GetEquipmentSetDisplayName(expectedGearID) or "?") or "—",
+		expectedGearID
 	)
 end
 
@@ -620,11 +753,11 @@ function NMT:TryForceShowWarning()
 		self:PresentRaidTalentWarning(raid, self:GetRaidPromptKey(instanceType, difficultyID))
 		return true
 	end
-	local show, expectedID, currentID, kind, ctx = self:ShouldWarnForDungeon()
+	local show, expectedID, currentID, kind, ctx, expectedGear = self:ShouldWarnForDungeon()
 	if not show then
 		return false
 	end
-	self:PresentDungeonTalentWarning(expectedID, currentID, kind, ctx)
+	self:PresentDungeonTalentWarning(expectedID, currentID, kind, ctx, expectedGear)
 	return true
 end
 
@@ -666,13 +799,28 @@ NMT._LoadConfigResult = {
 local eventFrame = CreateFrame("Frame")
 local checkTimer
 
---- True if at least one raid boss row with a saved loadout expects a different config than the current selection.
-local function RaidConfiguredBossesMismatchCurrent(raid)
+local function RaidBossRowMismatchTalent(journalInstanceID, bossIndex)
+	local exp = NMT:GetExpectedRaidLoadout(journalInstanceID, bossIndex)
+	if not exp then
+		return false
+	end
 	local currentID = NMT:GetSelectedLoadoutConfigID()
+	return not currentID or exp ~= currentID
+end
+
+local function RaidBossRowMismatchGear(journalInstanceID, bossIndex)
+	local expG = NMT:GetExpectedRaidGear(journalInstanceID, bossIndex)
+	if not expG then
+		return false
+	end
+	return not NMT:IsEquipmentSetEquipped(expG)
+end
+
+--- True if some undefeated boss row with a saved expectation has a talent or gear mismatch.
+local function RaidConfiguredBossesMismatchCurrent(raid)
 	local jid = raid.journalInstanceID
 	for _, e in ipairs(raid.undefeatedBosses) do
-		local exp = NMT:GetExpectedRaidLoadout(jid, e.index)
-		if exp and (not currentID or exp ~= currentID) then
+		if RaidBossRowMismatchTalent(jid, e.index) or RaidBossRowMismatchGear(jid, e.index) then
 			return true
 		end
 	end
@@ -744,19 +892,42 @@ local function DoInstanceCheck()
 		return
 	end
 
-	local show, expectedID, currentID, kind, ctx = NMT:ShouldWarnForDungeon()
+	local show, expectedID, currentID, kind, ctx, expectedGear = NMT:ShouldWarnForDungeon()
 	if show and NMT.UI and NMT.UI.ShowWarning then
-		NMT:PresentDungeonTalentWarning(expectedID, currentID, kind, ctx)
+		NMT:PresentDungeonTalentWarning(expectedID, currentID, kind, ctx, expectedGear)
 	end
 end
 
-local function ScheduleCheck()
+local CHECK_DELAY_SEC = 0.5
+local CHECK_DEFER_RETRY_SEC = 2
+
+--- Skip automatic instance warning while swapping talents (cast), fighting, or inside a timed M+ run.
+local function ShouldDeferInstanceCheck()
+	if UnitAffectingCombat("player") then
+		return true
+	end
+	if UnitCastingInfo("player") or UnitChannelInfo("player") then
+		return true
+	end
+	if CM and CM.IsChallengeModeActive and CM.IsChallengeModeActive() then
+		return true
+	end
+	return false
+end
+
+--- @param delaySec number|nil default CHECK_DELAY_SEC; retries after defer use CHECK_DEFER_RETRY_SEC
+local function ScheduleCheck(delaySec)
 	if checkTimer then
 		checkTimer:Cancel()
 		checkTimer = nil
 	end
-	checkTimer = C_Timer.NewTimer(0.5, function()
+	delaySec = delaySec or CHECK_DELAY_SEC
+	checkTimer = C_Timer.NewTimer(delaySec, function()
 		checkTimer = nil
+		if ShouldDeferInstanceCheck() then
+			ScheduleCheck(CHECK_DEFER_RETRY_SEC)
+			return
+		end
 		DoInstanceCheck()
 	end)
 end
@@ -776,6 +947,7 @@ eventFrame:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
 eventFrame:RegisterEvent("ENCOUNTER_END")
 eventFrame:RegisterEvent("TRAIT_CONFIG_UPDATED")
 eventFrame:RegisterEvent("READY_CHECK")
+eventFrame:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
 
 eventFrame:SetScript("OnEvent", function(_, event, arg1, ...)
 	if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
@@ -802,6 +974,8 @@ eventFrame:SetScript("OnEvent", function(_, event, arg1, ...)
 		NMT:ClearReadyCheckTalentWarnGate()
 		ScheduleCheck()
 	elseif event == "TRAIT_CONFIG_UPDATED" then
+		ScheduleCheck()
+	elseif event == "PLAYER_EQUIPMENT_CHANGED" then
 		ScheduleCheck()
 	elseif event == "READY_CHECK" then
 		if NMT._readyCheckTalentWarnShown or not NMT._enabled then

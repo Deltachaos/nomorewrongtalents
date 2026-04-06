@@ -3,13 +3,34 @@ NMT.UI = NMT.UI or {}
 
 local UI = NMT.UI
 
-local WARNING_W, WARNING_H = 380, 220
+local WARNING_W, WARNING_H = 380, 340
 local WARNING_RAID_BOSS_EXTRA_H = 52
-local DROPDOWN_ROW_H = 52
+-- Options: label left of UIDropDownMenuTemplate on one row
+local OPTIONS_LABEL_COL_W = 68
+local OPTIONS_DD_ROW_H = 30
+local OPTIONS_DD_BLOCK_H = OPTIONS_DD_ROW_H
+local OPTIONS_DD_GAP_H = 6
+local OPTIONS_TITLE_TO_DD = 16
+-- Stacked: instance/boss name + talents row + gap + gear row + pad
+local OPTIONS_STACK_ROW_H = OPTIONS_TITLE_TO_DD + OPTIONS_DD_BLOCK_H + OPTIONS_DD_GAP_H + OPTIONS_DD_BLOCK_H + 8
 local OPTIONS_W = 780
+-- UIPanelScrollFrameTemplate: vertical bar sits inside SetWidth; reserve or columns overflow the viewport.
+local OPTIONS_SCROLLBAR_ALLOWANCE = 24
+-- UIDropDownMenuTemplate draws wider than UIDropDownMenu_SetWidth (arrow/borders).
+local OPTIONS_DROPDOWN_WIDTH_PAD = 10
+-- Keep M+ grid inside backdrop inner edge (widening OPTIONS_W only scales columns — does not fix chrome overflow).
+local OPTIONS_DUNGEON_GRID_RIGHT_TRIM = 8
 local OPTIONS_COLS = 3
 local OPTIONS_SIDE_MARGIN = 16
-local OPTIONS_COL_GAP = 10
+local OPTIONS_COL_GAP = 15
+local OPTIONS_INTER_ROW_GAP = 5
+-- Bump when column/scroll/dropdown layout changes (invalidates cached options frame).
+local OPTIONS_LAYOUT_REV = 3
+
+-- Options panel: label colors (RGB 0–1) for quicker scanning
+local OPT_CLR_SECTION = { 1, 0.85, 0.45 } -- warm gold — M+ / Raids / Raid instance
+local OPT_CLR_PLACE = { 0.7, 0.82, 1 } -- light blue — dungeon or boss name
+local OPT_CLR_FIELD = { 0.5, 0.92, 0.72 } -- mint — Talents / Gear row labels
 
 local warningFrame
 local optionsFrame
@@ -101,7 +122,7 @@ function UI:EnsureMinimapButton()
 		GameTooltip:SetOwner(self, "ANCHOR_LEFT")
 		GameTooltip:AddLine("NoMoreWrongTalents")
 		GameTooltip:AddLine("|cffffffffLeft-click|r to open settings", 0.8, 0.8, 0.8)
-		GameTooltip:AddLine("|cffffffffRight-click|r to open talent check (raid / M+ when applicable)", 0.8, 0.8, 0.8)
+		GameTooltip:AddLine("|cffffffffRight-click|r to open check (raid / M+ when applicable)", 0.8, 0.8, 0.8)
 		GameTooltip:AddLine("|cffffffffDrag|r to move", 0.65, 0.65, 0.65)
 		GameTooltip:Show()
 	end)
@@ -140,26 +161,31 @@ function UI:RefreshRaidWarningFromBossPick()
 		return
 	end
 	local expectedID = NMT:GetExpectedRaidLoadout(raid.journalInstanceID, raid.bossIndex)
+	local expectedGear = NMT:GetExpectedRaidGear(raid.journalInstanceID, raid.bossIndex)
 	f.pendingExpectedConfigID = expectedID
+	f.pendingExpectedGearSetID = expectedGear
 	local currentID = NMT:GetSelectedLoadoutConfigID()
-	f.currentBuild:SetText(NMT:GetLoadoutDisplayName(currentID) or "?")
-	f.expectedBuild:SetText(expectedID and (NMT:GetLoadoutDisplayName(expectedID) or "?") or "Not set")
+	local curGearID = NMT:GetEquippedEquipmentSetID()
+	f.currentBuild:SetText(NMT:GetLoadoutDisplayName(currentID) or "—")
+	f.expectedBuild:SetText(expectedID and (NMT:GetLoadoutDisplayName(expectedID) or "?") or "—")
+	f.gearCurrent:SetText(NMT:GetEquipmentSetDisplayName(curGearID) or "—")
+	f.gearExpected:SetText(expectedGear and (NMT:GetEquipmentSetDisplayName(expectedGear) or "?") or "—")
 	local gname = raid.guessedBossName or "?"
 	f.message:SetText(
 		"Select the boss you intend to pull next (default: |cffffcc00"
 			.. gname
-			.. "|r). Compare your loadout below; switch if it does not match."
+			.. "|r). Compare talents and gear below; switch if something does not match."
 	)
-	if expectedID then
+	local needTal = expectedID and (not currentID or currentID ~= expectedID)
+	local needGear = expectedGear and not NMT:IsEquipmentSetEquipped(expectedGear)
+	if needTal or needGear then
 		if InCombatLockdown() then
 			f.switchBtn:Disable()
 			if f.status:GetText() == "" then
 				f.status:SetText("|cffffcc00Leave combat to switch.|r")
 			end
-		elseif currentID and currentID ~= expectedID then
-			f.switchBtn:Enable()
 		else
-			f.switchBtn:Disable()
+			f.switchBtn:Enable()
 		end
 	else
 		f.switchBtn:Disable()
@@ -188,7 +214,7 @@ local function CreateWarningFrame()
 
 	local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
 	title:SetPoint("TOP", 0, -14)
-	title:SetText("|cffff9900Talent loadout|r")
+	title:SetText("|cffff9900Talents & gear|r")
 	f.title = title
 
 	local message = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
@@ -216,7 +242,7 @@ local function CreateWarningFrame()
 
 	local curLab = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 	curLab:SetPoint("TOPLEFT", 24, -68)
-	curLab:SetText("Current:")
+	curLab:SetText("Talents (current):")
 	f.curLab = curLab
 	local cur = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
 	cur:SetPoint("TOPLEFT", curLab, "BOTTOMLEFT", 0, -2)
@@ -227,7 +253,7 @@ local function CreateWarningFrame()
 
 	local expLab = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 	expLab:SetPoint("TOPLEFT", cur, "BOTTOMLEFT", 0, -10)
-	expLab:SetText("Expected:")
+	expLab:SetText("Talents (expected):")
 	local exp = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
 	exp:SetPoint("TOPLEFT", expLab, "BOTTOMLEFT", 0, -2)
 	exp:SetTextColor(0.35, 1, 0.45)
@@ -235,28 +261,75 @@ local function CreateWarningFrame()
 	exp:SetJustifyH("LEFT")
 	f.expectedBuild = exp
 
+	local gearCurLab = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	gearCurLab:SetPoint("TOPLEFT", exp, "BOTTOMLEFT", 0, -12)
+	gearCurLab:SetText("Gear (current):")
+	f.gearCurLab = gearCurLab
+	local gearCur = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+	gearCur:SetPoint("TOPLEFT", gearCurLab, "BOTTOMLEFT", 0, -2)
+	gearCur:SetTextColor(1, 0.35, 0.35)
+	gearCur:SetWidth(WARNING_W - 48)
+	gearCur:SetJustifyH("LEFT")
+	f.gearCurrent = gearCur
+
+	local gearExpLab = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	gearExpLab:SetPoint("TOPLEFT", gearCur, "BOTTOMLEFT", 0, -10)
+	gearExpLab:SetText("Gear (expected):")
+	local gearExp = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+	gearExp:SetPoint("TOPLEFT", gearExpLab, "BOTTOMLEFT", 0, -2)
+	gearExp:SetTextColor(0.35, 1, 0.45)
+	gearExp:SetWidth(WARNING_W - 48)
+	gearExp:SetJustifyH("LEFT")
+	f.gearExpected = gearExp
+
+	--- Equip expected gear set when needed; returns false on failure (talents are not applied).
+	local function TryApplyExpectedGear()
+		local gearID = f.pendingExpectedGearSetID
+		if not gearID or NMT:IsEquipmentSetEquipped(gearID) then
+			return true
+		end
+		local ok, gerr = NMT:ApplyGearSetByID(gearID)
+		if not ok then
+			local msg = gerr == "combat" and "Leave combat to change gear."
+				or gerr == "failed" and "Could not equip that set."
+				or "Gear sets unavailable."
+			UI:SetSwitchStatus("|cffff3333" .. msg .. "|r")
+			return false
+		end
+		return true
+	end
+
 	local switch = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-	switch:SetSize(130, 28)
+	switch:SetSize(140, 28)
 	switch:SetPoint("BOTTOMLEFT", 24, 16)
-	switch:SetText("Switch loadout")
+	switch:SetText("Switch")
 	switch:SetScript("OnClick", function()
-		local configID = f.pendingExpectedConfigID
-		if not configID then return end
 		if InCombatLockdown() then
-			UI:SetSwitchStatus("|cffff3333Leave combat to switch talents.|r")
+			UI:SetSwitchStatus("|cffff3333Leave combat to switch.|r")
 			return
 		end
-		local result, err = NMT:ApplyLoadoutByConfigID(configID)
-		local R = NMT._LoadConfigResult
-		if result == R.Error then
-			local msg = err == "not_found" and "Loadout not found." or "Could not switch (combat or error)."
-			UI:SetSwitchStatus("|cffff3333" .. msg .. "|r")
-		elseif result == R.LoadInProgress then
-			UI:SetSwitchStatus("|cffffff00Applying talents…|r")
-			f.awaitingTraits = true
-		elseif result == R.Ready or result == R.NoChangesNecessary then
-			f:Hide()
+		local configID = f.pendingExpectedConfigID
+		local needTal = configID and NMT:GetSelectedLoadoutConfigID() ~= configID
+		local gearID = f.pendingExpectedGearSetID
+		local needGear = gearID and not NMT:IsEquipmentSetEquipped(gearID)
+		if not needTal and not needGear then
+			return
 		end
+		TryApplyExpectedGear()
+		if needTal then
+			local result, err = NMT:ApplyLoadoutByConfigID(configID)
+			local R = NMT._LoadConfigResult
+			if result == R.Error then
+				local msg = err == "not_found" and "Loadout not found." or "Could not switch talents."
+				UI:SetSwitchStatus("|cffff3333" .. msg .. "|r")
+				return
+			elseif result == R.LoadInProgress then
+				f.awaitingTraits = true
+				UI:SetSwitchStatus("|cffffff00Applying talents…|r")
+				return
+			end
+		end
+		f:Hide()
 	end)
 	f.switchBtn = switch
 
@@ -277,6 +350,7 @@ local function CreateWarningFrame()
 	f:SetScript("OnHide", function(self)
 		self.awaitingTraits = false
 		self.pendingExpectedConfigID = nil
+		self.pendingExpectedGearSetID = nil
 		self.warningKind = nil
 		self._undefeatedBossList = nil
 		if self.status then
@@ -299,10 +373,16 @@ local function CreateWarningFrame()
 				else
 					if self.warningKind == "raid" then
 						UI:RefreshRaidWarningFromBossPick()
-					elseif self.pendingExpectedConfigID then
-						self.switchBtn:Enable()
 					else
-						self.switchBtn:Disable()
+						local needTal = self.pendingExpectedConfigID
+							and NMT:GetSelectedLoadoutConfigID() ~= self.pendingExpectedConfigID
+						local needGear = self.pendingExpectedGearSetID
+							and not NMT:IsEquipmentSetEquipped(self.pendingExpectedGearSetID)
+						if needTal or needGear then
+							self.switchBtn:Enable()
+						else
+							self.switchBtn:Disable()
+						end
 					end
 					if self.status:GetText() == "|cffffcc00Leave combat to switch.|r" then
 						self.status:SetText("")
@@ -331,14 +411,24 @@ function UI:SetSwitchStatus(text)
 	end
 end
 
---- expectedConfigID: trait config to apply with "Switch loadout" (nil = preview / no switch)
-function UI:ShowWarning(currentBuildName, expectedBuildName, kind, ctx, expectedConfigID)
+--- expectedConfigID / expectedGearSetID: what "Switch" applies (nil = none).
+function UI:ShowWarning(
+	currentBuildName,
+	expectedBuildName,
+	kind,
+	ctx,
+	expectedConfigID,
+	currentGearName,
+	expectedGearName,
+	expectedGearSetID
+)
 	if not warningFrame then
 		warningFrame = CreateWarningFrame()
 	end
 	local f = warningFrame
 	f.warningKind = kind
 	f.pendingExpectedConfigID = expectedConfigID
+	f.pendingExpectedGearSetID = expectedGearSetID
 	f.awaitingTraits = false
 	f.status:SetText("")
 
@@ -363,12 +453,7 @@ function UI:ShowWarning(currentBuildName, expectedBuildName, kind, ctx, expected
 			end
 		end)
 		UIDropDownMenu_SetText(f.bossDropdown, ctx.bossName or "?")
-		local gname = ctx.guessedBossName or "?"
-		f.message:SetText(
-			"Select the boss you intend to pull next (default: |cffffcc00"
-				.. gname
-				.. "|r). Compare your loadout below; switch if it does not match."
-		)
+		UI:RefreshRaidWarningFromBossPick()
 	else
 		f._undefeatedBossList = nil
 		ApplyWarningRaidLayout(f, false)
@@ -380,34 +465,25 @@ function UI:ShowWarning(currentBuildName, expectedBuildName, kind, ctx, expected
 		else
 			where = "instance"
 		end
-		f.message:SetText("Wrong talent loadout for |cffffcc00" .. where .. "|r.")
-	end
+		f.message:SetText("Wrong talents or gear for |cffffcc00" .. where .. "|r.")
 
-	f.currentBuild:SetText(currentBuildName or "?")
-	f.expectedBuild:SetText(expectedBuildName or "?")
+		f.currentBuild:SetText(currentBuildName or "—")
+		f.expectedBuild:SetText(expectedBuildName or "—")
+		f.gearCurrent:SetText(currentGearName or "—")
+		f.gearExpected:SetText(expectedGearName or "—")
 
-	if isRaidBossPicker then
-		if expectedConfigID then
+		local needTal = expectedConfigID and NMT:GetSelectedLoadoutConfigID() ~= expectedConfigID
+		local needGear = expectedGearSetID and not NMT:IsEquipmentSetEquipped(expectedGearSetID)
+		if needTal or needGear then
 			if InCombatLockdown() then
 				f.switchBtn:Disable()
 				f.status:SetText("|cffffcc00Leave combat to switch.|r")
-			elseif NMT:GetSelectedLoadoutConfigID() ~= expectedConfigID then
-				f.switchBtn:Enable()
 			else
-				f.switchBtn:Disable()
+				f.switchBtn:Enable()
 			end
 		else
 			f.switchBtn:Disable()
 		end
-	elseif expectedConfigID then
-		if InCombatLockdown() then
-			f.switchBtn:Disable()
-			f.status:SetText("|cffffcc00Leave combat to switch.|r")
-		else
-			f.switchBtn:Enable()
-		end
-	else
-		f.switchBtn:Disable()
 	end
 	f:Show()
 end
@@ -420,19 +496,23 @@ end
 
 --- @return container (holds label + dropdown)
 local function CreateLoadoutDropdown(parent, x, y, width, labelText, getValue, setValue)
+	local labelCol = OPTIONS_LABEL_COL_W
+	local gap = 8
 	local container = CreateFrame("Frame", nil, parent)
-	container:SetSize(width, DROPDOWN_ROW_H + 6)
+	container:SetSize(width, OPTIONS_DD_ROW_H)
 	container:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
 
 	local label = container:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	label:SetPoint("TOPLEFT", 0, 0)
-	label:SetWidth(width - 8)
+	label:SetPoint("LEFT", container, "LEFT", 0, 0)
+	label:SetWidth(labelCol)
 	label:SetJustifyH("LEFT")
+	label:SetJustifyV("MIDDLE")
 	label:SetText(labelText)
+	label:SetTextColor(OPT_CLR_FIELD[1], OPT_CLR_FIELD[2], OPT_CLR_FIELD[3])
 
 	local dd = CreateFrame("Frame", nil, container, "UIDropDownMenuTemplate")
-	dd:SetPoint("TOPLEFT", container, "TOPLEFT", -14, -18)
-	UIDropDownMenu_SetWidth(dd, width - 20)
+	dd:SetPoint("TOPLEFT", container, "TOPLEFT", labelCol + gap - 14, -10)
+	UIDropDownMenu_SetWidth(dd, math.max(72, width - labelCol - gap - 12 - OPTIONS_DROPDOWN_WIDTH_PAD))
 
 	local function Init(_, level)
 		local info = UIDropDownMenu_CreateInfo()
@@ -470,6 +550,73 @@ local function CreateLoadoutDropdown(parent, x, y, width, labelText, getValue, s
 	return container
 end
 
+local function CreateGearDropdown(parent, x, y, width, labelText, getValue, setValue)
+	local labelCol = OPTIONS_LABEL_COL_W
+	local gap = 8
+	local container = CreateFrame("Frame", nil, parent)
+	container:SetSize(width, OPTIONS_DD_ROW_H)
+	container:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
+
+	local label = container:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	label:SetPoint("LEFT", container, "LEFT", 0, 0)
+	label:SetWidth(labelCol)
+	label:SetJustifyH("LEFT")
+	label:SetJustifyV("MIDDLE")
+	label:SetText(labelText)
+	label:SetTextColor(OPT_CLR_FIELD[1], OPT_CLR_FIELD[2], OPT_CLR_FIELD[3])
+
+	local dd = CreateFrame("Frame", nil, container, "UIDropDownMenuTemplate")
+	dd:SetPoint("TOPLEFT", container, "TOPLEFT", labelCol + gap - 14, -10)
+	UIDropDownMenu_SetWidth(dd, math.max(72, width - labelCol - gap - 12 - OPTIONS_DROPDOWN_WIDTH_PAD))
+
+	local function Init(_, level)
+		local info = UIDropDownMenu_CreateInfo()
+		info.text = "-- None --"
+		info.func = function()
+			setValue(nil)
+			UIDropDownMenu_SetText(dd, "-- None --")
+			CloseDropDownMenus()
+		end
+		info.checked = (getValue() == nil)
+		UIDropDownMenu_AddButton(info, level)
+
+		if not NMT:CanUseEquipmentSets() then
+			info = UIDropDownMenu_CreateInfo()
+			info.text = "(Equipment sets unavailable)"
+			info.disabled = true
+			UIDropDownMenu_AddButton(info, level)
+			return
+		end
+
+		for _, entry in ipairs(NMT:GetEquipmentSetList()) do
+			info = UIDropDownMenu_CreateInfo()
+			info.text = entry.name
+			info.func = function()
+				setValue(entry.id)
+				UIDropDownMenu_SetText(dd, entry.name)
+				CloseDropDownMenus()
+			end
+			info.checked = (getValue() == entry.id)
+			UIDropDownMenu_AddButton(info, level)
+		end
+	end
+
+	local function refreshLabel()
+		local id = getValue()
+		local txt = "-- None --"
+		if id then
+			txt = NMT:GetEquipmentSetDisplayName(id) or ("#" .. tostring(id))
+		end
+		UIDropDownMenu_SetText(dd, txt)
+	end
+
+	UIDropDownMenu_Initialize(dd, Init)
+	refreshLabel()
+	dd:HookScript("OnShow", refreshLabel)
+	container.dropdown = dd
+	return container
+end
+
 local function WipeRaidBossRows()
 	for _, row in pairs(raidBossDropdowns) do
 		if row.container then
@@ -485,9 +632,11 @@ local optsRaidInstanceID
 
 --- @param contentWidth total width available for columns (full window or scroll inner)
 --- @param sideMargin optional horizontal inset (default OPTIONS_SIDE_MARGIN)
-local function OptionsColumnLayout(contentWidth, sideMargin)
+--- @param innerTrim extra px subtracted from usable width (right-side breathing room inside panel)
+local function OptionsColumnLayout(contentWidth, sideMargin, innerTrim)
 	sideMargin = sideMargin or OPTIONS_SIDE_MARGIN
-	local usable = contentWidth - 2 * sideMargin
+	innerTrim = innerTrim or 0
+	local usable = contentWidth - 2 * sideMargin - innerTrim
 	local w = (usable - OPTIONS_COL_GAP * (OPTIONS_COLS - 1)) / OPTIONS_COLS
 	return w, function(colIndexZeroBased)
 		return sideMargin + colIndexZeroBased * (w + OPTIONS_COL_GAP)
@@ -502,32 +651,41 @@ local function RefreshRaidBossArea()
 		raidSectionAnchor:SetHeight(40)
 		return
 	end
-	local scrollInnerW = OPTIONS_W - 48
-	local colW, colX = OptionsColumnLayout(scrollInnerW, 8)
+	local scrollViewportW = OPTIONS_W - 48
+	local raidContentW = scrollViewportW - OPTIONS_SCROLLBAR_ALLOWANCE
+	local colW, colX = OptionsColumnLayout(raidContentW, 8, 0)
 	local encounters = NMT:GetEncounterListForJournalInstance(inst, nil)
-	local rowStride = DROPDOWN_ROW_H + 10
+	local rowStride = OPTIONS_STACK_ROW_H + OPTIONS_INTER_ROW_GAP
 	for idx, enc in ipairs(encounters) do
 		local col = (idx - 1) % OPTIONS_COLS
 		local row = math.floor((idx - 1) / OPTIONS_COLS)
 		local x = colX(col)
 		local y = -4 - row * rowStride
-		local container = CreateLoadoutDropdown(
-			raidSectionAnchor,
-			x,
-			y,
-			colW,
-			enc.name,
-			function()
-				return NMT:GetExpectedRaidLoadout(inst, enc.index)
-			end,
-			function(configID)
-				NMT:SetExpectedRaidLoadout(inst, enc.index, configID)
-			end
-		)
-		raidBossDropdowns[#raidBossDropdowns + 1] = { container = container }
+		local rowFrame = CreateFrame("Frame", nil, raidSectionAnchor)
+		rowFrame:SetSize(colW, OPTIONS_STACK_ROW_H)
+		rowFrame:SetPoint("TOPLEFT", raidSectionAnchor, "TOPLEFT", x, y)
+		local encTitle = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+		encTitle:SetPoint("TOPLEFT", 0, 0)
+		encTitle:SetWidth(colW - 4)
+		encTitle:SetJustifyH("LEFT")
+		encTitle:SetText(enc.name)
+		encTitle:SetTextColor(OPT_CLR_PLACE[1], OPT_CLR_PLACE[2], OPT_CLR_PLACE[3])
+		local talentY = -OPTIONS_TITLE_TO_DD
+		local gearY = talentY - OPTIONS_DD_BLOCK_H - OPTIONS_DD_GAP_H
+		CreateLoadoutDropdown(rowFrame, 0, talentY, colW, "Talents", function()
+			return NMT:GetExpectedRaidLoadout(inst, enc.index)
+		end, function(configID)
+			NMT:SetExpectedRaidLoadout(inst, enc.index, configID)
+		end)
+		CreateGearDropdown(rowFrame, 0, gearY, colW, "Gear", function()
+			return NMT:GetExpectedRaidGear(inst, enc.index)
+		end, function(setID)
+			NMT:SetExpectedRaidGear(inst, enc.index, setID)
+		end)
+		raidBossDropdowns[#raidBossDropdowns + 1] = { container = rowFrame }
 	end
 	local nRows = math.max(1, math.ceil(#encounters / OPTIONS_COLS))
-	raidSectionAnchor:SetWidth(scrollInnerW - 4)
+	raidSectionAnchor:SetWidth(raidContentW)
 	raidSectionAnchor:SetHeight(math.max(60, 8 + nRows * rowStride))
 end
 
@@ -549,7 +707,11 @@ function UI:CreateOrUpdateOptionsFrame()
 		table.sort(sorted)
 	end
 
-	local sig = (#sorted > 0) and table.concat(sorted, ",") or "EMPTY"
+	local sig = ((#sorted > 0) and table.concat(sorted, ",") or "EMPTY")
+		.. ":"
+		.. tostring(OPTIONS_W)
+		.. ":"
+		.. tostring(OPTIONS_LAYOUT_REV)
 	if optionsFrame and optionsFrame._cmSig == sig then
 		return
 	end
@@ -563,11 +725,12 @@ function UI:CreateOrUpdateOptionsFrame()
 	wipe(dungeonDropdowns)
 
 	local rows = math.max(1, math.ceil(math.max(#sorted, 1) / OPTIONS_COLS))
+	local dunRowStride = OPTIONS_STACK_ROW_H + OPTIONS_INTER_ROW_GAP
 	local raidHeaderH = 72
 	local raidScrollMinH = 220
 	-- Extra space between raid instance dropdown and boss scroll area
 	local raidInstToScrollGap = 32
-	local frameH = 100 + rows * (DROPDOWN_ROW_H + 10) + raidHeaderH + raidScrollMinH + 40 + raidInstToScrollGap
+	local frameH = 100 + rows * dunRowStride + raidHeaderH + raidScrollMinH + 40 + raidInstToScrollGap
 
 	local f = CreateFrame("Frame", "NoMoreWrongTalentsOptions", UIParent, "BackdropTemplate")
 	f:SetSize(OPTIONS_W, frameH)
@@ -600,30 +763,38 @@ function UI:CreateOrUpdateOptionsFrame()
 	local dunHeader = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	dunHeader:SetPoint("TOPLEFT", 20, -64)
 	dunHeader:SetText("Mythic+ season dungeons (character-specific)")
+	dunHeader:SetTextColor(OPT_CLR_SECTION[1], OPT_CLR_SECTION[2], OPT_CLR_SECTION[3])
 
-	local colW, colX = OptionsColumnLayout(OPTIONS_W)
+	local colW, colX = OptionsColumnLayout(OPTIONS_W, nil, OPTIONS_DUNGEON_GRID_RIGHT_TRIM)
 	local y0 = -88
-	local dunRowStride = DROPDOWN_ROW_H + 10
 	for i, cmID in ipairs(sorted) do
 		local c = (i - 1) % OPTIONS_COLS
 		local row = math.floor((i - 1) / OPTIONS_COLS)
 		local x = colX(c)
 		local y = y0 - row * dunRowStride
 		local dname = NMT:GetCmDungeonName(cmID) or ("Map " .. tostring(cmID))
-		local container = CreateLoadoutDropdown(
-			f,
-			x,
-			y,
-			colW,
-			dname,
-			function()
-				return NMT:GetExpectedDungeonLoadout(cmID)
-			end,
-			function(configID)
-				NMT:SetExpectedDungeonLoadout(cmID, configID)
-			end
-		)
-		dungeonDropdowns[cmID] = container.dropdown
+		local rowFrame = CreateFrame("Frame", nil, f)
+		rowFrame:SetSize(colW, OPTIONS_STACK_ROW_H)
+		rowFrame:SetPoint("TOPLEFT", f, "TOPLEFT", x, y)
+		local rowTitle = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+		rowTitle:SetPoint("TOPLEFT", 0, 0)
+		rowTitle:SetWidth(colW - 4)
+		rowTitle:SetJustifyH("LEFT")
+		rowTitle:SetText(dname)
+		rowTitle:SetTextColor(OPT_CLR_PLACE[1], OPT_CLR_PLACE[2], OPT_CLR_PLACE[3])
+		local talentY = -OPTIONS_TITLE_TO_DD
+		local gearY = talentY - OPTIONS_DD_BLOCK_H - OPTIONS_DD_GAP_H
+		local tcont = CreateLoadoutDropdown(rowFrame, 0, talentY, colW, "Talents", function()
+			return NMT:GetExpectedDungeonLoadout(cmID)
+		end, function(configID)
+			NMT:SetExpectedDungeonLoadout(cmID, configID)
+		end)
+		local gcont = CreateGearDropdown(rowFrame, 0, gearY, colW, "Gear", function()
+			return NMT:GetExpectedDungeonGear(cmID)
+		end, function(setID)
+			NMT:SetExpectedDungeonGear(cmID, setID)
+		end)
+		dungeonDropdowns[cmID] = { talent = tcont.dropdown, gear = gcont.dropdown }
 	end
 
 	if #sorted == 0 then
@@ -638,10 +809,12 @@ function UI:CreateOrUpdateOptionsFrame()
 	local raidHdr = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	raidHdr:SetPoint("TOPLEFT", 20, raidY)
 	raidHdr:SetText("Raids (per boss, all difficulties)")
+	raidHdr:SetTextColor(OPT_CLR_SECTION[1], OPT_CLR_SECTION[2], OPT_CLR_SECTION[3])
 
 	local raidInstLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 	raidInstLabel:SetPoint("TOPLEFT", 24, raidY - 22)
 	raidInstLabel:SetText("Raid instance")
+	raidInstLabel:SetTextColor(OPT_CLR_SECTION[1], OPT_CLR_SECTION[2], OPT_CLR_SECTION[3])
 
 	local raidInstDD = CreateFrame("Frame", nil, f, "UIDropDownMenuTemplate")
 	raidInstDD:SetPoint("TOPLEFT", raidInstLabel, "BOTTOMLEFT", -16, -10)
@@ -721,10 +894,20 @@ function UI:ShowOptions()
 	if optionsFrame.minimapCheckbox then
 		optionsFrame.minimapCheckbox:SetChecked(not NoMoreWrongTalentsDB.hideMinimapButton)
 	end
-	for cmID, dd in pairs(dungeonDropdowns) do
-		if dd then
+	for cmID, pair in pairs(dungeonDropdowns) do
+		if pair and pair.talent then
 			local id = NMT:GetExpectedDungeonLoadout(cmID)
-			UIDropDownMenu_SetText(dd, id and (NMT:GetLoadoutDisplayName(id) or ("#" .. tostring(id))) or "-- None --")
+			UIDropDownMenu_SetText(
+				pair.talent,
+				id and (NMT:GetLoadoutDisplayName(id) or ("#" .. tostring(id))) or "-- None --"
+			)
+		end
+		if pair and pair.gear then
+			local gid = NMT:GetExpectedDungeonGear(cmID)
+			UIDropDownMenu_SetText(
+				pair.gear,
+				gid and (NMT:GetEquipmentSetDisplayName(gid) or ("#" .. tostring(gid))) or "-- None --"
+			)
 		end
 	end
 	RefreshRaidBossArea()
@@ -745,9 +928,9 @@ function UI:RegisterOptionsPanel()
 		d:SetWidth(math.min(720, OPTIONS_W - 40))
 		d:SetJustifyH("LEFT")
 		d:SetText(
-			"On entering a season Mythic+ dungeon or a raid, warns if your selected talent loadout "
-				.. "does not match the loadout configured for that place. "
-				.. "In raids, a warning appears only when your selected loadout differs from at least one boss loadout you configured for your current map wing (bosses you have killed this instance visit are omitted); the default pick is the first of those in journal order. "
+			"On entering a season Mythic+ dungeon or a raid, warns if your selected talent loadout or equipped gear set "
+				.. "does not match what you configured for that place. "
+				.. "In raids, a warning appears only when something differs from at least one boss you configured for your current map wing (bosses you have killed this instance visit are omitted); the default pick is the first of those in journal order. "
 				.. "Open settings with |cffffcc00/nmwt|r or the minimap button."
 		)
 
