@@ -1,0 +1,12 @@
+## Interface: 120000, 120001
+## Title: NoMoreWrongTalents
+## Notes: Warns when your talent loadout does not match settings for the current Mythic+ dungeon or raid boss, with one-click loadout switch.
+## Author: Deltachaos
+## Version: 1.0.0
+## IconTexture: Interface\AddOns\NoMoreWrongTalents\logo
+## SavedVariablesPerCharacter: NoMoreWrongTalentsDB
+## X-Curse-Project-ID: 1506130
+## Category: Dungeons & Raids
+
+Core.lua
+UI.lua
