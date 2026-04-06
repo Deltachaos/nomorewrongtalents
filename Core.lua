@@ -628,10 +628,23 @@ function NMT:TryForceShowWarning()
 	return true
 end
 
---- Same as: /run C_ClassTalents.LoadConfig(configID, true)
+--- Prefer ClassTalentHelper.SwitchToLoadoutByName (e.g. from a companion addon) when available;
+--- otherwise C_ClassTalents.LoadConfig(configID, true).
 function NMT:ApplyLoadoutByConfigID(configID)
 	if not configID then return RESULT_ERROR, "not_found" end
 	if InCombatLockdown() then return RESULT_ERROR, "combat" end
+
+	local CTH = ClassTalentHelper
+	if CTH and type(CTH.SwitchToLoadoutByName) == "function" then
+		local name = self:GetLoadoutDisplayName(configID)
+		if name and name ~= "" then
+			local ok = CTH.SwitchToLoadoutByName(name)
+			if ok ~= false then
+				return RESULT_READY, nil
+			end
+		end
+	end
+
 	if not C_ClassTalents.LoadConfig then return RESULT_ERROR, "api" end
 	local result, err = C_ClassTalents.LoadConfig(configID, true)
 	return result, err
