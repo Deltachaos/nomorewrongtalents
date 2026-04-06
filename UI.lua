@@ -92,6 +92,8 @@ function UI:EnsureMinimapButton()
 	minimapButton:SetScript("OnClick", function(_, button)
 		if button == "LeftButton" then
 			UI:ShowOptions()
+		elseif button == "RightButton" then
+			NMT:TryForceShowWarning()
 		end
 	end)
 
@@ -99,6 +101,7 @@ function UI:EnsureMinimapButton()
 		GameTooltip:SetOwner(self, "ANCHOR_LEFT")
 		GameTooltip:AddLine("NoMoreWrongTalents")
 		GameTooltip:AddLine("|cffffffffLeft-click|r to open settings", 0.8, 0.8, 0.8)
+		GameTooltip:AddLine("|cffffffffRight-click|r to open talent check (raid / M+ when applicable)", 0.8, 0.8, 0.8)
 		GameTooltip:AddLine("|cffffffffDrag|r to move", 0.65, 0.65, 0.65)
 		GameTooltip:Show()
 	end)
@@ -202,7 +205,7 @@ local function CreateWarningFrame()
 
 	local bossLab = bossSection:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 	bossLab:SetPoint("TOPLEFT", 0, 0)
-	bossLab:SetText("Next boss (undefeated):")
+	bossLab:SetText("Boss encounter:")
 	bossLab:SetWidth(WARNING_W - 48)
 	bossLab:SetJustifyH("LEFT")
 
@@ -744,7 +747,7 @@ function UI:RegisterOptionsPanel()
 		d:SetText(
 			"On entering a season Mythic+ dungeon or a raid, warns if your selected talent loadout "
 				.. "does not match the loadout configured for that place. "
-				.. "Raid expectations use your lockout to guess the next boss (linear order; may be wrong if you skip). "
+				.. "In raids, a warning appears only when your selected loadout differs from at least one boss loadout you configured for your current map wing (bosses you have killed this instance visit are omitted); the default pick is the first of those in journal order. "
 				.. "Open settings with |cffffcc00/nmwt|r or the minimap button."
 		)
 

@@ -18,6 +18,14 @@ NMT._raidBossPick = {
 NMT._lastRaidInstanceKey = nil
 --- After raid warning is shown for this key, hide repeats until boss kill or new raid instance.
 NMT._raidPromptShownForKey = nil
+--- Per map-instance run (GetInstanceInfo instanceID): DungeonEncounterIDs killed with success this visit.
+NMT._defeatedDungeonEncounterThisInstance = {}
+--- "instanceType:instanceID" — when it changes we reset session defeated bosses (new instance / left instance).
+NMT._instanceRunKey = nil
+--- READY_CHECK (raid only) may show the talent warning at most once until cleared (zone / spec / kill / enter).
+NMT._readyCheckTalentWarnShown = false
+--- Raid: DungeonEncounterID we last wiped to this instance (nil after kill or new run).
+NMT._lastWipeDungeonEncounterID = nil
 
 -- LoadConfig result (Enum.LoadConfigResult in client; use numeric fallbacks)
 local RESULT_ERROR = 0
@@ -34,6 +42,9 @@ end
 local mapTableCache = nil
 local mapTableCacheAt = 0
 local MAP_TABLE_CACHE_TTL = 8
+
+--- Key: journalInstanceID .. ":" .. difficultyIDOr0 → encounter row list from EJ
+local encounterListCache = {}
 
 local function GetCurrentSpecID()
 	if PlayerUtil and PlayerUtil.GetCurrentSpecID then
@@ -192,9 +203,26 @@ local function ejIsRaidDifficulty(difficultyID)
 	return EJ_IsValidInstanceDifficulty(difficultyID)
 end
 
+function NMT:ClearEncounterListCache()
+	wipe(encounterListCache)
+end
+
+function NMT:ClearDefeatedEncountersThisInstance()
+	wipe(self._defeatedDungeonEncounterThisInstance)
+end
+
 --- Build ordered list { { index, name, journalEncounterID, dungeonEncounterID }, ... }
+--- Results are cached per (journalInstanceID, difficultyID); cleared on zone changes.
 function NMT:GetEncounterListForJournalInstance(journalInstanceID, difficultyID)
-	if not journalInstanceID or not EJ_SelectInstance then return {} end
+	if not journalInstanceID or not EJ_SelectInstance then
+		return {}
+	end
+	local cacheKey = tostring(journalInstanceID) .. ":" .. tostring(difficultyID or 0)
+	local cached = encounterListCache[cacheKey]
+	if cached then
+		return cached
+	end
+
 	local prevDiff = EJ_GetDifficulty and EJ_GetDifficulty() or nil
 
 	local ok = pcall(function()
@@ -203,7 +231,9 @@ function NMT:GetEncounterListForJournalInstance(journalInstanceID, difficultyID)
 			EJ_SetDifficulty(difficultyID)
 		end
 	end)
-	if not ok then return {} end
+	if not ok then
+		return {}
+	end
 
 	local list = {}
 	local i = 1
@@ -227,66 +257,81 @@ function NMT:GetEncounterListForJournalInstance(journalInstanceID, difficultyID)
 		pcall(EJ_SetDifficulty, prevDiff)
 	end
 
+	encounterListCache[cacheKey] = list
 	return list
 end
 
---- Find saved-instance index matching current raid (name + difficulty), or nil.
-function NMT:FindSavedRaidLockoutIndex()
-	local instName, instanceType, difficultyID = GetInstanceInfo()
-	if instanceType ~= "raid" then return nil end
-	local n = GetNumSavedInstances and GetNumSavedInstances() or 0
-	for i = 1, n do
-		local name, _, _, diff, locked, _, _, isRaid = GetSavedInstanceInfo(i)
-		if isRaid and locked and name and instName then
-			if diff == difficultyID then
-				if name == instName then
-					return i
-				end
-				-- loose match (suffixes / realm)
-				if name:find(instName, 1, true) or instName:find(name, 1, true) then
-					return i
-				end
+--- Keep only EJ rows whose journal encounter appears on the player's current uiMap (wing / floor).
+--- If the API returns nothing or filtering removes every row, returns encounterRows unchanged.
+function NMT:FilterEncounterRowsForPlayerMap(encounterRows)
+	if not encounterRows or #encounterRows == 0 then
+		return encounterRows or {}
+	end
+	if not C_Map or not C_Map.GetBestMapForUnit then
+		return encounterRows
+	end
+	if not C_EncounterJournal or not C_EncounterJournal.GetEncountersOnMap then
+		return encounterRows
+	end
+	local uiMapID = C_Map.GetBestMapForUnit("player")
+	if not uiMapID or uiMapID == 0 then
+		return encounterRows
+	end
+	local ok, onMap = pcall(C_EncounterJournal.GetEncountersOnMap, uiMapID)
+	if not ok or type(onMap) ~= "table" or #onMap == 0 then
+		return encounterRows
+	end
+	local allowed = {}
+	for _, info in ipairs(onMap) do
+		if type(info) == "table" then
+			local eid = info.encounterID or info.journalEncounterID
+			if eid then
+				allowed[eid] = true
 			end
 		end
 	end
-	return nil
+	if not next(allowed) then
+		return encounterRows
+	end
+	local out = {}
+	for _, e in ipairs(encounterRows) do
+		if e.journalEncounterID and allowed[e.journalEncounterID] then
+			out[#out + 1] = e
+		end
+	end
+	if #out == 0 then
+		return encounterRows
+	end
+	return out
 end
 
---- All bosses still alive in lockout order (EJ index + name). No lockout yet → full EJ list.
-function NMT:GetUndefeatedRaidBosses(journalInstanceID, difficultyID)
-	local encounters = self:GetEncounterListForJournalInstance(journalInstanceID, difficultyID)
-	if #encounters == 0 then
-		return {}
+--- Drops rows whose dungeon encounter was killed this instance (ENCOUNTER_END success). DungeonEncounterID may be nil on some rows; those stay.
+--- Result may be empty when every boss on this pass was defeated (valid).
+function NMT:FilterEncounterRowsNotDefeatedThisInstance(encounterRows)
+	if not encounterRows or #encounterRows == 0 then
+		return encounterRows or {}
 	end
-	local savedIdx = self:FindSavedRaidLockoutIndex()
+	local def = self._defeatedDungeonEncounterThisInstance
+	if not next(def) then
+		return encounterRows
+	end
 	local out = {}
-	if not savedIdx then
-		for _, enc in ipairs(encounters) do
-			out[#out + 1] = { index = enc.index, name = enc.name }
-		end
-		return out
-	end
-	local _, _, _, _, _, _, _, _, _, _, numEncounters = GetSavedInstanceInfo(savedIdx)
-	numEncounters = numEncounters or #encounters
-	for _, enc in ipairs(encounters) do
-		if enc.index > numEncounters then
-			break
-		end
-		local encName, _, defeated = GetSavedInstanceEncounterInfo(savedIdx, enc.index)
-		if encName and not defeated then
-			out[#out + 1] = { index = enc.index, name = encName }
+	for _, e in ipairs(encounterRows) do
+		local dId = e.dungeonEncounterID
+		if not dId or not def[dId] then
+			out[#out + 1] = e
 		end
 	end
 	return out
 end
 
---- Undefeated bosses that have a non-nil expected loadout saved for this journal (current spec).
-function NMT:FilterRaidBossesWithLoadout(journalInstanceID, undefeatedBosses)
-	if not journalInstanceID or not undefeatedBosses then
+--- Boss rows from the EJ encounter list that have a saved expected loadout (current spec).
+function NMT:FilterRaidBossesWithLoadout(journalInstanceID, encounterRows)
+	if not journalInstanceID or not encounterRows then
 		return {}
 	end
 	local out = {}
-	for _, e in ipairs(undefeatedBosses) do
+	for _, e in ipairs(encounterRows) do
 		if self:GetExpectedRaidLoadout(journalInstanceID, e.index) then
 			out[#out + 1] = e
 		end
@@ -294,11 +339,26 @@ function NMT:FilterRaidBossesWithLoadout(journalInstanceID, undefeatedBosses)
 	return out
 end
 
+--- Full raid encounter list for this journal, narrowed to bosses pinned on the current map, then loadout-only rows.
+function NMT:GetRaidBossChoicesForContext(journalInstanceID, difficultyID)
+	local encounters = self:GetEncounterListForJournalInstance(journalInstanceID, difficultyID)
+	if #encounters == 0 then
+		return {}
+	end
+	local onThisMap = self:FilterEncounterRowsForPlayerMap(encounters)
+	local notKilled = self:FilterEncounterRowsNotDefeatedThisInstance(onThisMap)
+	return self:FilterRaidBossesWithLoadout(journalInstanceID, notKilled)
+end
+
 function NMT:ClearRaidBossPick()
 	local p = self._raidBossPick
 	p.journalInstanceID = nil
 	p.difficultyID = nil
 	p.bossIndex = nil
+end
+
+function NMT:ClearReadyCheckTalentWarnGate()
+	self._readyCheckTalentWarnShown = false
 end
 
 function NMT:SetRaidBossPickForCurrentRaid(bossIndex)
@@ -326,26 +386,8 @@ function NMT:GetRaidContext()
 		return nil
 	end
 
-	local encounters = self:GetEncounterListForJournalInstance(journalInstanceID, difficultyID)
-	if #encounters == 0 then
-		return nil
-	end
-
-	local undefeatedAll = self:GetUndefeatedRaidBosses(journalInstanceID, difficultyID)
-	if #undefeatedAll == 0 then
-		return {
-			journalInstanceID = journalInstanceID,
-			difficultyID = difficultyID,
-			bossIndex = nil,
-			bossName = nil,
-			instanceName = instName,
-			complete = true,
-			undefeatedBosses = {},
-		}
-	end
-
-	local undefeated = self:FilterRaidBossesWithLoadout(journalInstanceID, undefeatedAll)
-	if #undefeated == 0 then
+	local bossChoices = self:GetRaidBossChoicesForContext(journalInstanceID, difficultyID)
+	if #bossChoices == 0 then
 		return {
 			journalInstanceID = journalInstanceID,
 			difficultyID = difficultyID,
@@ -357,8 +399,8 @@ function NMT:GetRaidContext()
 		}
 	end
 
-	local guessedIndex = undefeated[1].index
-	local guessedName = undefeated[1].name
+	local guessedIndex = bossChoices[1].index
+	local guessedName = bossChoices[1].name
 	local effectiveIndex = guessedIndex
 	local effectiveName = guessedName
 	local pick = self._raidBossPick
@@ -367,7 +409,7 @@ function NMT:GetRaidContext()
 		and pick.difficultyID == difficultyID
 		and pick.bossIndex
 	then
-		for _, e in ipairs(undefeated) do
+		for _, e in ipairs(bossChoices) do
 			if e.index == pick.bossIndex then
 				effectiveIndex = e.index
 				effectiveName = e.name
@@ -381,11 +423,9 @@ function NMT:GetRaidContext()
 		difficultyID = difficultyID,
 		bossIndex = effectiveIndex,
 		bossName = effectiveName,
-		guessedBossIndex = guessedIndex,
-		guessedBossName = guessedName,
 		instanceName = instName,
 		complete = false,
-		undefeatedBosses = undefeated,
+		undefeatedBosses = bossChoices,
 	}
 end
 
@@ -519,6 +559,75 @@ function NMT:ShouldWarnNow()
 	return self:ShouldWarnForDungeon()
 end
 
+--- Stable key for suppressing repeat raid prompts (nil if not in a journal-backed raid).
+function NMT:GetRaidPromptKey(instanceType, difficultyID)
+	if instanceType ~= "raid" then
+		return nil
+	end
+	local jid = self:GetJournalInstanceForPlayerMap()
+	if not jid then
+		return nil
+	end
+	return tostring(jid) .. ":" .. tostring(difficultyID or 0)
+end
+
+function NMT:PresentRaidTalentWarning(raid, raidKey)
+	if not self.UI or not self.UI.ShowWarning then
+		return
+	end
+	local expectedID = self:GetExpectedRaidLoadout(raid.journalInstanceID, raid.bossIndex)
+	local currentID = self:GetSelectedLoadoutConfigID()
+	self.UI:ShowWarning(
+		self:GetLoadoutDisplayName(currentID) or "?",
+		expectedID and (self:GetLoadoutDisplayName(expectedID) or "?") or "Not set",
+		"raid",
+		raid,
+		expectedID
+	)
+	if raidKey then
+		self._raidPromptShownForKey = raidKey
+	end
+end
+
+function NMT:PresentDungeonTalentWarning(expectedID, currentID, kind, ctx)
+	if not self.UI or not self.UI.ShowWarning then
+		return
+	end
+	self.UI:ShowWarning(
+		self:GetLoadoutDisplayName(currentID) or "?",
+		self:GetLoadoutDisplayName(expectedID) or "?",
+		kind,
+		ctx,
+		expectedID
+	)
+end
+
+--- Open the talent warning if context allows: raid with at least one configured boss choice, or M+ with loadout mismatch.
+--- @return boolean whether the window was shown
+function NMT:TryForceShowWarning()
+	if not self._enabled or not self.UI or not self.UI.ShowWarning then
+		return false
+	end
+	if self.UI.IsRaidWarningShown and self.UI:IsRaidWarningShown() then
+		return false
+	end
+	local _, instanceType, difficultyID = GetInstanceInfo()
+	if instanceType == "raid" then
+		local raid = self:GetRaidContext()
+		if not raid or raid.complete or not raid.undefeatedBosses or #raid.undefeatedBosses == 0 then
+			return false
+		end
+		self:PresentRaidTalentWarning(raid, self:GetRaidPromptKey(instanceType, difficultyID))
+		return true
+	end
+	local show, expectedID, currentID, kind, ctx = self:ShouldWarnForDungeon()
+	if not show then
+		return false
+	end
+	self:PresentDungeonTalentWarning(expectedID, currentID, kind, ctx)
+	return true
+end
+
 --- Same as: /run C_ClassTalents.LoadConfig(configID, true)
 function NMT:ApplyLoadoutByConfigID(configID)
 	if not configID then return RESULT_ERROR, "not_found" end
@@ -544,6 +653,40 @@ NMT._LoadConfigResult = {
 local eventFrame = CreateFrame("Frame")
 local checkTimer
 
+--- True if at least one raid boss row with a saved loadout expects a different config than the current selection.
+local function RaidConfiguredBossesMismatchCurrent(raid)
+	local currentID = NMT:GetSelectedLoadoutConfigID()
+	local jid = raid.journalInstanceID
+	for _, e in ipairs(raid.undefeatedBosses) do
+		local exp = NMT:GetExpectedRaidLoadout(jid, e.index)
+		if exp and (not currentID or exp ~= currentID) then
+			return true
+		end
+	end
+	return false
+end
+
+--- @param ignoreRaidPromptKey boolean if true, show even when _raidPromptShownForKey would block (READY_CHECK once).
+--- @return boolean whether the raid warning was shown
+local function TryPresentRaidMismatchWarning(raid, raidKey, ignoreRaidPromptKey)
+	if not NMT.UI or not NMT.UI.ShowWarning then
+		return false
+	end
+	if not raid or raid.complete or not raid.undefeatedBosses or #raid.undefeatedBosses == 0 then
+		return false
+	end
+	if not RaidConfiguredBossesMismatchCurrent(raid) then
+		return false
+	end
+	if not ignoreRaidPromptKey then
+		if not raidKey or raidKey == NMT._raidPromptShownForKey then
+			return false
+		end
+	end
+	NMT:PresentRaidTalentWarning(raid, raidKey)
+	return true
+end
+
 local function DoInstanceCheck()
 	if not NMT._enabled then
 		return
@@ -552,14 +695,17 @@ local function DoInstanceCheck()
 		return
 	end
 
-	local _, instanceType, difficultyID = GetInstanceInfo()
-	local raidKey = nil
-	if instanceType == "raid" then
-		local jid = NMT:GetJournalInstanceForPlayerMap()
-		if jid then
-			raidKey = tostring(jid) .. ":" .. tostring(difficultyID or 0)
-		end
+	local _, instanceType, difficultyID, _, _, _, _, instanceRunId = GetInstanceInfo()
+	instanceRunId = instanceRunId or 0
+	local instanceRunKey = tostring(instanceType or "none") .. ":" .. tostring(instanceRunId)
+	if instanceRunKey ~= NMT._instanceRunKey then
+		NMT._instanceRunKey = instanceRunKey
+		NMT:ClearDefeatedEncountersThisInstance()
+		NMT:ClearRaidBossPick()
+		NMT._raidPromptShownForKey = nil
+		NMT._lastWipeDungeonEncounterID = nil
 	end
+	local raidKey = NMT:GetRaidPromptKey(instanceType, difficultyID)
 	if raidKey then
 		if raidKey ~= NMT._lastRaidInstanceKey then
 			NMT:ClearRaidBossPick()
@@ -574,17 +720,12 @@ local function DoInstanceCheck()
 	if instanceType == "raid" and NMT.UI and NMT.UI.ShowWarning then
 		local raid = NMT:GetRaidContext()
 		if raid and not raid.complete and raid.undefeatedBosses and #raid.undefeatedBosses > 0 then
-			if raidKey and raidKey ~= NMT._raidPromptShownForKey then
-				local expectedID = NMT:GetExpectedRaidLoadout(raid.journalInstanceID, raid.bossIndex)
-				local currentID = NMT:GetSelectedLoadoutConfigID()
-				NMT.UI:ShowWarning(
-					NMT:GetLoadoutDisplayName(currentID) or "?",
-					expectedID and (NMT:GetLoadoutDisplayName(expectedID) or "?") or "Not set",
-					"raid",
-					raid,
-					expectedID
-				)
-				NMT._raidPromptShownForKey = raidKey
+			if not RaidConfiguredBossesMismatchCurrent(raid) then
+				if raidKey then
+					NMT._raidPromptShownForKey = nil
+				end
+			else
+				TryPresentRaidMismatchWarning(raid, raidKey, false)
 			end
 		end
 		return
@@ -592,13 +733,7 @@ local function DoInstanceCheck()
 
 	local show, expectedID, currentID, kind, ctx = NMT:ShouldWarnForDungeon()
 	if show and NMT.UI and NMT.UI.ShowWarning then
-		NMT.UI:ShowWarning(
-			NMT:GetLoadoutDisplayName(currentID) or "?",
-			NMT:GetLoadoutDisplayName(expectedID) or "?",
-			kind,
-			ctx,
-			expectedID
-		)
+		NMT:PresentDungeonTalentWarning(expectedID, currentID, kind, ctx)
 	end
 end
 
@@ -626,6 +761,8 @@ eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 eventFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
 eventFrame:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
 eventFrame:RegisterEvent("ENCOUNTER_END")
+eventFrame:RegisterEvent("TRAIT_CONFIG_UPDATED")
+eventFrame:RegisterEvent("READY_CHECK")
 
 eventFrame:SetScript("OnEvent", function(_, event, arg1, ...)
 	if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
@@ -640,21 +777,64 @@ eventFrame:SetScript("OnEvent", function(_, event, arg1, ...)
 		end
 		print("|cff33ff99NoMoreWrongTalents|r loaded. |cffffcc00/nmwt|r — settings.")
 	elseif event == "PLAYER_ENTERING_WORLD" then
+		NMT:ClearReadyCheckTalentWarnGate()
+		NMT:ClearEncounterListCache()
 		NMT:RefreshChallengeMapTable()
 		ScheduleCheck()
 	elseif event == "ZONE_CHANGED_NEW_AREA" then
+		NMT:ClearReadyCheckTalentWarnGate()
+		NMT:ClearEncounterListCache()
 		ScheduleCheck()
 	elseif event == "PLAYER_SPECIALIZATION_CHANGED" then
+		NMT:ClearReadyCheckTalentWarnGate()
 		ScheduleCheck()
+	elseif event == "TRAIT_CONFIG_UPDATED" then
+		ScheduleCheck()
+	elseif event == "READY_CHECK" then
+		if NMT._readyCheckTalentWarnShown or not NMT._enabled then
+			return
+		end
+		if NMT.UI and NMT.UI.IsRaidWarningShown and NMT.UI:IsRaidWarningShown() then
+			return
+		end
+		local _, instanceType, difficultyID = GetInstanceInfo()
+		if instanceType ~= "raid" or not NMT.UI or not NMT.UI.ShowWarning then
+			return
+		end
+		local raidKey = NMT:GetRaidPromptKey(instanceType, difficultyID)
+		local raid = NMT:GetRaidContext()
+		if TryPresentRaidMismatchWarning(raid, raidKey, true) then
+			NMT._readyCheckTalentWarnShown = true
+		end
 	elseif event == "ENCOUNTER_END" then
-		-- arg1 = encounterID; ... = name, difficultyID, raidSize, success
+		-- arg1 = DungeonEncounterID; ... = encounterName, difficultyID, groupSize, success (1 = kill)
+		local dungeonEncounterID = arg1
 		local success = select(4, ...)
 		local _, instType = GetInstanceInfo()
-		if instType == "raid" and success then
-			NMT:ClearRaidBossPick()
-			NMT._raidPromptShownForKey = nil
+		if instType == "raid" then
+			local encId = (dungeonEncounterID and type(dungeonEncounterID) == "number" and dungeonEncounterID > 0)
+				and dungeonEncounterID
+				or nil
+
+			if success == 1 or success == true then
+				NMT._lastWipeDungeonEncounterID = nil
+				NMT._raidPromptShownForKey = nil
+				NMT:ClearReadyCheckTalentWarnGate()
+				NMT:ClearRaidBossPick()
+				if encId then
+					NMT._defeatedDungeonEncounterThisInstance[encId] = true
+				end
+				ScheduleCheck()
+			elseif encId then
+				-- Wipe: remember boss; if we wiped a different encounter than last time, allow prompts again.
+				if NMT._lastWipeDungeonEncounterID and NMT._lastWipeDungeonEncounterID ~= encId then
+					NMT._raidPromptShownForKey = nil
+					NMT:ClearReadyCheckTalentWarnGate()
+					ScheduleCheck()
+				end
+				NMT._lastWipeDungeonEncounterID = encId
+			end
 		end
-		ScheduleCheck()
 	end
 end)
 
